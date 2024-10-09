@@ -64,6 +64,68 @@ def get_obj(positions, name, index=0):
     cube0.export(name)
 
 
+def get_batched_ik(
+    rotation: torch.tensor,
+    offset: torch.tensor,
+    parents: list,
+    chain: torch.tensor,
+    target_position: torch.tensor,
+    lr=0.001,
+    epoch=1000,
+):
+    """
+    Args:
+        rotation: torch.tensor (...., n_joint, 4), In Quatanion.
+        offset: torch.tensor (..., n_joint, 3)
+        chain: list(n_joint)
+        target_position: torch.tensor (..., 3)
+    Returns:
+        new_rotation: torch.tensor (...., n_joint, 4), In Quatanion.
+    """
+    rotation_mat = quaternion_to_matrix(rotation)  # (324,29,3,3),PASSED
+    local_mat = matrix.get_TRS(rotation_mat, offset)  # (324,29,4,4),PASSED
+
+    fk_mat = matrix.forward_kinematics(local_mat, parents)  # (324,29,4,4),PASSED
+
+    local_mat_short = local_mat[..., chain, :, :].clone()
+    local_mat_short[..., 0, :, :] = fk_mat[..., chain[0], :, :].clone()
+    parent_short = [i - 1 for i in range(len(chain))]
+
+    fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
+    positions_short = matrix.get_position(fk_mat_short)
+    rotations_short = matrix.get_rotation(local_mat_short)
+    quat = matrix_to_quaternion(rotations_short[:, 1])
+    loss_fn = torch.nn.MSELoss()  # 使用均方误差损失
+    for step in range(epoch):
+        var = torch.nn.Parameter(quat.clone().detach().requires_grad_())
+        optimizer = torch.optim.Adamax([var], lr=lr)
+        optimizer.zero_grad()  # 清除前一轮的梯度
+        local_mat_temp = local_mat_short.clone()
+        local_mat_temp[:, 1, :3, :3] = quaternion_to_matrix(var)
+        positions_temp = matrix.get_position(
+            matrix.forward_kinematics(local_mat_temp, parent_short)
+        )
+        end_pos_temp = positions_temp[:, -1]
+        start_pos_temp = positions_temp[:, 1]
+
+        loss = loss_fn(
+            torch.nn.functional.normalize(end_pos_temp - start_pos_temp),
+            torch.nn.functional.normalize(target_position - start_pos_temp),
+        )
+        loss.backward()
+        optimizer.step()
+        quat = var.clone().detach()
+        if step % 10 == 0:
+            print(f"Step {step}, Loss: {loss.item()}")
+
+    chain_rotmat = matrix.get_rotation(local_mat_short)
+    chain_rotmat[:, 1] = quaternion_to_matrix(quat)
+    local_mat[..., chain[1:], :-1, :-1] = chain_rotmat[..., 1:, :, :]  # (B, L, J, 3, 3)
+    rotation_mat = matrix.get_rotation(local_mat)
+    new_rotation = matrix_to_quaternion(rotation_mat)
+    return new_rotation
+
+
 def example(
     input_file_dir: str,
     output_path: str,
@@ -82,8 +144,8 @@ def example(
     offset = (
         torch.from_numpy(anim.offsets).unsqueeze(0).repeat(clip_len, 1, 1)
     )  # (324,29,3),PASSED
-    local_mat = matrix.get_TRS(rotation_mat, offset)  # (324,29,4,4),PASSED
 
+    local_mat = matrix.get_TRS(rotation_mat, offset)  # (324,29,4,4),PASSED
     fk_mat = matrix.forward_kinematics(local_mat, anim.parents)  # (324,29,4,4),PASSED
     global_rot = matrix.get_rotation(fk_mat).clone()  # (324,29,3,3),CONFERMED
     positions = matrix.get_position(fk_mat).clone()
@@ -117,71 +179,78 @@ def example(
     fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
     positions_short = matrix.get_position(fk_mat_short)
     rotations_short = matrix.get_rotation(local_mat_short)
-    root_position = positions_short[:, 0, :]
-    original_position = positions_short[:, 1, :]
+    root_position = positions_short[:, 1, :]
+    original_position = positions_short[:, -1, :]
     target_position = target_points.clone()
     quat = matrix_to_quaternion(rotations_short[:, 1])
 
     # region Torch optimize
-    # epoch = 100
-    # target = target_position
-    # loss_fn = torch.nn.MSELoss()  # 使用均方误差损失
-    # for step in range(epoch):
-    #     var = torch.nn.Parameter(quat.clone().detach().requires_grad_())
-    #     optimizer = torch.optim.Adamax([var], lr=0.01)
-    #     optimizer.zero_grad()  # 清除前一轮的梯度
-    #     local_mat_temp = local_mat_short.clone()
-    #     local_mat_temp[:, 1, :3, :3] = quaternion_to_matrix(var)
-    #     end_pos_temp = matrix.get_position(
-    #         matrix.forward_kinematics(local_mat_temp, parent_short)
-    #     )[:, -1]
-    #     loss = loss_fn(end_pos_temp, target)
-    #     loss.backward()
-    #     optimizer.step()
-    #     quat = var.clone().detach()
-    #     if step % 10 == 0:
-    #         print(f"Step {step}, Loss: {loss.item()}")
-
-    # chain_rotmat = matrix.get_rotation(local_mat_short)
-    # chain_rotmat[:, 1] = quaternion_to_matrix(quat)
-    # local_mat[..., chain[1:], :-1, :-1] = chain_rotmat[..., 1:, :, :]  # (B, L, J, 3, 3)
-    # endregion
-    # region traditional
-    solved_pos_target_quat = qmul(
-        qbetween(
-            original_position - root_position, target_position - original_position
-        ),
-        quat,
-    )
-
-    x_vec = torch.zeros((quat.shape[:-1] + (3,)), device=quat.device)
-    x_vec[..., 0] = 1.0
-    x_vec_sum = torch.zeros_like(x_vec)
-    y_vec = torch.zeros((quat.shape[:-1] + (3,)), device=quat.device)
-    y_vec[..., 1] = 1.0
-    y_vec_sum = torch.zeros_like(y_vec)
-    x_vec_sum += qrot(solved_pos_target_quat, x_vec)
-    y_vec_sum += qrot(solved_pos_target_quat, y_vec)
-
-    x_vec_avg = matrix.normalize(x_vec_sum / count)
-    y_vec_avg = matrix.normalize(y_vec_sum / count)
-    z_vec_avg = torch.cross(x_vec_avg, y_vec_avg, dim=-1)
-    solved_rot = torch.stack([x_vec_avg, y_vec_avg, z_vec_avg], dim=-1)  # column
-    parent_rot = matrix.get_rotation(fk_mat_short)[..., 0, :, :]
-    solved_local_rot = matrix.get_mat_BtoA(parent_rot, solved_rot)
-
-    local_mat_short[..., 1, :-1, :-1] = solved_local_rot
-    new_fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
-    new_position_short = matrix.get_position(new_fk_mat_short)
-
-    print(
-        torch.norm(
-            torch.nn.functional.normalize(
-                new_position_short[:, -1, :] - new_position_short[:, 1, :]
-            )
-            - torch.nn.functional.normalize(target_points - new_position_short[:, 1, :])
+    epoch = 1000
+    target = target_position
+    loss_fn = torch.nn.MSELoss()  # 使用均方误差损失
+    for step in range(epoch):
+        var = torch.nn.Parameter(quat.clone().detach().requires_grad_())
+        optimizer = torch.optim.Adamax([var], lr=0.001)
+        optimizer.zero_grad()  # 清除前一轮的梯度
+        local_mat_temp = local_mat_short.clone()
+        local_mat_temp[:, 1, :3, :3] = quaternion_to_matrix(var)
+        positions_temp = matrix.get_position(
+            matrix.forward_kinematics(local_mat_temp, parent_short)
         )
-    )
+        end_pos_temp = positions_temp[:, -1]
+        start_pos_temp = positions_temp[:, 1]
+
+        loss = loss_fn(
+            torch.nn.functional.normalize(end_pos_temp - start_pos_temp),
+            torch.nn.functional.normalize(target_points - start_pos_temp),
+        )
+        loss.backward()
+        optimizer.step()
+        quat = var.clone().detach()
+        if step % 10 == 0:
+            print(f"Step {step}, Loss: {loss.item()}")
+
+    chain_rotmat = matrix.get_rotation(local_mat_short)
+    chain_rotmat[:, 1] = quaternion_to_matrix(quat)
+    local_mat[..., chain[1:], :-1, :-1] = chain_rotmat[..., 1:, :, :]  # (B, L, J, 3, 3)
+    # endregion
+
+    # region traditional
+    # solved_pos_target_quat = qmul(
+    #     qbetween(
+    #         original_position - root_position, target_position - original_position
+    #     ),
+    #     quat,
+    # )
+
+    # x_vec = torch.zeros((quat.shape[:-1] + (3,)), device=quat.device)
+    # x_vec[..., 0] = 1.0
+    # x_vec_sum = torch.zeros_like(x_vec)
+    # y_vec = torch.zeros((quat.shape[:-1] + (3,)), device=quat.device)
+    # y_vec[..., 1] = 1.0
+    # y_vec_sum = torch.zeros_like(y_vec)
+    # x_vec_sum += qrot(solved_pos_target_quat, x_vec)
+    # y_vec_sum += qrot(solved_pos_target_quat, y_vec)
+
+    # x_vec_avg = matrix.normalize(x_vec_sum / count)
+    # y_vec_avg = matrix.normalize(y_vec_sum / count)
+    # z_vec_avg = torch.cross(x_vec_avg, y_vec_avg, dim=-1)
+    # solved_rot = torch.stack([x_vec_avg, y_vec_avg, z_vec_avg], dim=-1)  # column
+    # parent_rot = matrix.get_rotation(fk_mat_short)[..., 0, :, :]
+    # solved_local_rot = matrix.get_mat_BtoA(parent_rot, solved_rot)
+
+    # local_mat_short[..., 1, :-1, :-1] = solved_local_rot
+    # new_fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
+    # new_position_short = matrix.get_position(new_fk_mat_short)
+
+    # print(
+    #     torch.norm(
+    #         torch.nn.functional.normalize(
+    #             new_position_short[:, -1, :] - new_position_short[:, 1, :]
+    #         )
+    #         - torch.nn.functional.normalize(target_points - new_position_short[:, 1, :])
+    #     )
+    # )
     # endregion
     # endregion
 

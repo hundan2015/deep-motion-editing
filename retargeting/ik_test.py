@@ -70,6 +70,7 @@ def get_batched_ik(
     parents: list,
     chain: torch.tensor,
     target_position: torch.tensor,
+    ik_position: int = 1,
     lr=0.001,
     epoch=1000,
     is_log=False,
@@ -93,21 +94,37 @@ def get_batched_ik(
     parent_short = [i - 1 for i in range(len(chain))]
 
     rotations_short = matrix.get_rotation(local_mat_short)
-    quat = matrix_to_quaternion(rotations_short[:, 1])
+    quat = matrix_to_quaternion(rotations_short[:, ik_position])
+
+    fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
+    positions_short = matrix.get_position(fk_mat_short)
+
+    # region traditional
+    end_position = positions_short[..., -1, :]
+    current_position = positions_short[..., ik_position, :]
+    current_vector = torch.nn.functional.normalize(
+        end_position - current_position, dim=-1
+    )
+    target_vector = torch.nn.functional.normalize(
+        target_position - current_position, dim=-1
+    )
+
+    quat = qmul(qbetween(current_vector, target_vector), quat)
+    # endregion
+
+    # region Torch optimize
     loss_fn = torch.nn.MSELoss()  # 使用均方误差损失
     for step in range(epoch):
         var = torch.nn.Parameter(quat.clone().detach().requires_grad_())
         optimizer = torch.optim.Adamax([var], lr=lr)
         optimizer.zero_grad()  # 清除前一轮的梯度
         local_mat_temp = local_mat_short.clone()
-        local_mat_temp[:, 1, :3, :3] = quaternion_to_matrix(var)
+        local_mat_temp[:, ik_position, :3, :3] = quaternion_to_matrix(var)
         positions_temp = matrix.get_position(
-            matrix.forward_kinematics(
-                local_mat_temp, parent_short
-            )  # TODO: 改local_mat_temp，添加并行的算法，直接让他们一起算
+            matrix.forward_kinematics(local_mat_temp, parent_short)
         )
         end_pos_temp = positions_temp[:, -1]
-        start_pos_temp = positions_temp[:, 1]
+        start_pos_temp = positions_temp[:, ik_position]
 
         loss = loss_fn(
             torch.nn.functional.normalize(end_pos_temp - start_pos_temp),
@@ -118,9 +135,10 @@ def get_batched_ik(
         quat = var.clone().detach()
         if is_log and step % 10 == 0:
             print(f"Step {step}, Loss: {loss.item()}")
+    # endregion
 
     chain_rotmat = matrix.get_rotation(local_mat_short)
-    chain_rotmat[:, 1] = quaternion_to_matrix(quat)
+    chain_rotmat[:, ik_position] = quaternion_to_matrix(quat)
     local_mat[..., chain[1:], :-1, :-1] = chain_rotmat[..., 1:, :, :]  # (B, L, J, 3, 3)
     rotation_mat = matrix.get_rotation(local_mat)
     new_rotation = matrix_to_quaternion(rotation_mat)
@@ -169,6 +187,7 @@ def example(
         anim.parents,
         chain,
         target_points,
+        3
     )
 
     anim.rotations = Quaternions(rotation.numpy())
@@ -180,6 +199,6 @@ def example(
 if __name__ == "__main__":
     example(
         "./datasets/Mixamo/Aj/Disappointed.bvh",
-        "./examples/intra_structure/fuck3.bvh",
+        "./examples/intra_structure/fuck32.bvh",
     )
     print("Finished!")

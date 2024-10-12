@@ -13,6 +13,8 @@ from models.utils import (
 from models.base_model import BaseModel
 from option_parser import try_mkdir
 
+from ik_test import *
+
 import os
 
 
@@ -226,6 +228,7 @@ class GAN_model(BaseModel):
                     for p in range(self.args.num_layers + 1)
                 ]
 
+                # region direct optimize
                 # Freeze params
                 for param in self.models[dst].auto_encoder.dec.parameters():
                     param.requires_grad = False
@@ -267,15 +270,94 @@ class GAN_model(BaseModel):
                         fake_res_denorm, self.dataset.offsets[dst][rnd_idx]
                     )
                     if src == 0 and dst == 1:
-                        # Left hand loss.
-                        loss = criterion(fake_pos[:, :, 18, :], target)
-                        # 反向传播并优化 latent 向量
-                        loss.backward(retain_graph=True)
-                        optimizer.step()
+                        chain = get_parent_chain_count(
+                            self.models[dst].fk.topology, self.dataset.ee_ids[dst][3], 5
+                        )
+                        for _ in range(len(chain) * 4):
+                            rotation = fake_res_denorm[:, :-3, :]
+                            rotation = rotation.reshape(
+                                (rotation.shape[0], -1, 4, rotation.shape[-1])
+                            )
+                            position = fake_res_denorm[:, -3:, :]
+                            position = position.transpose(-1, -2)
+                            rotation = rotation.transpose(-1, -3).transpose(-1, -2)
+                            tr = rotation[..., 0, :].clone()
+                            tr[..., :, :] = torch.tensor([1, 0, 0, 0]).to(tr.device)
+                            tr = tr.unsqueeze(-2)
+                            rotation = torch.cat((tr, rotation), dim=-2)
+                            # ee_name_monkey = ['LeftToeBase', 'RightToeBase', 'Head', 'LeftHand', 'RightHand']
 
-                        print(f"Step {step+1}, Loss: {loss.item()}")
+                            offset = (self.dataset.offsets[dst][rnd_idx]).unsqueeze(-3)
+                            tmp = [
+                                1 if i != 2 else rotation.shape[-3]
+                                for i in range(len(offset.shape))
+                            ]
+                            offset = offset.repeat(*tuple(tmp[::-1]))
+
+                            res_list = []
+
+                            def clean_tensor(t):
+                                return t.detach().clone().requires_grad_(False)
+
+                            for i in range(len(chain)):
+                                result = get_batched_ik(
+                                    clean_tensor(rotation),
+                                    offset,
+                                    self.models[dst].fk.topology,
+                                    chain,
+                                    clean_tensor(
+                                        self.res_pos[src][
+                                            :, :, self.dataset.ee_ids[src][3], :
+                                        ]
+                                        - position
+                                    ),  # Target position
+                                    i,
+                                )  # (1,108,28,4) => (1,28,4,108)
+                                result = result[..., 1:, :]
+                                result = result.reshape(
+                                    result.shape[:-2] + (-1,)
+                                ).transpose(-1, -2)
+                                result = torch.cat(
+                                    (result, fake_res_denorm[:, -3:, :]), dim=1
+                                )
+                                res_list.append(result)
+                            options = torch.stack(res_list)  # (5,1,111,108)
+                            tmp = options.reshape((-1,) + options.shape[2:])
+                            tmp_shape = options.shape[:2]
+                            new_latents = self.models[dst].auto_encoder.enc(
+                                tmp, dst_offsets_repr
+                            )
+                            new_latents = new_latents.reshape(
+                                tmp_shape + new_latents.shape[1:]
+                            )
+
+                            error = (
+                                (new_latents - fake_latent)
+                                .transpose(0, 1)
+                                .norm(dim=(2, 3))
+                            )
+                            select = error.argmin(dim=1)
+                            selected_latent = new_latents.transpose(0, 1)[
+                                list(range(new_latents.shape[1])), select
+                            ]
+                            fake_latent = selected_latent
+                            fake_res_denorm = self.models[dst].auto_encoder.dec(
+                                fake_latent, dst_offsets_repr
+                            )
+                            fake_pos = self.models[dst].fk.forward_from_raw(
+                                fake_res_denorm, self.dataset.offsets[dst][rnd_idx]
+                            )
+                    # options = options.transpose(0,1)
+                    # Left hand loss.
+                    # loss = criterion(fake_pos[:, :, 18, :], target)
+                    # 反向传播并优化 latent 向量
+                    # loss.backward(retain_graph=True)
+                    # optimizer.step()
+
+                    # print(f"Step {step+1}, Loss: {loss.item()}")
                     else:
                         break
+                # endregion
 
                 fake_ee = get_ee(
                     fake_pos,

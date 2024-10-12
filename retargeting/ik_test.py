@@ -42,6 +42,18 @@ def get_parent_chain(parents: list, index: int, stop: int) -> list:
     return res
 
 
+def get_parent_chain_count(parents: list, index: int, count: int) -> list:
+    current = index
+    res = []
+    counter = 0
+    while counter != count:
+        res.append(current)
+        current = parents[current]
+        counter += 1
+    res.reverse()
+    return res
+
+
 def get_id_from_joint_names(name_list: list, names: list) -> list:
     res = []
     for name in name_list:
@@ -94,7 +106,7 @@ def get_batched_ik(
     parent_short = [i - 1 for i in range(len(chain))]
 
     rotations_short = matrix.get_rotation(local_mat_short)
-    quat = matrix_to_quaternion(rotations_short[:, ik_position])
+    quat = matrix_to_quaternion(rotations_short[..., ik_position, :, :])
 
     fk_mat_short = matrix.forward_kinematics(local_mat_short, parent_short)
     positions_short = matrix.get_position(fk_mat_short)
@@ -119,12 +131,12 @@ def get_batched_ik(
         optimizer = torch.optim.Adamax([var], lr=lr)
         optimizer.zero_grad()  # 清除前一轮的梯度
         local_mat_temp = local_mat_short.clone()
-        local_mat_temp[:, ik_position, :3, :3] = quaternion_to_matrix(var)
+        local_mat_temp[..., ik_position, :3, :3] = quaternion_to_matrix(var)
         positions_temp = matrix.get_position(
             matrix.forward_kinematics(local_mat_temp, parent_short)
         )
-        end_pos_temp = positions_temp[:, -1]
-        start_pos_temp = positions_temp[:, ik_position]
+        end_pos_temp = positions_temp[..., -1, :]
+        start_pos_temp = positions_temp[..., ik_position, :]
 
         loss = loss_fn(
             torch.nn.functional.normalize(end_pos_temp - start_pos_temp),
@@ -138,7 +150,7 @@ def get_batched_ik(
     # endregion
 
     chain_rotmat = matrix.get_rotation(local_mat_short)
-    chain_rotmat[:, ik_position] = quaternion_to_matrix(quat)
+    chain_rotmat[..., ik_position, :, :] = quaternion_to_matrix(quat)
     local_mat[..., chain[1:], :-1, :-1] = chain_rotmat[..., 1:, :, :]  # (B, L, J, 3, 3)
     rotation_mat = matrix.get_rotation(local_mat)
     new_rotation = matrix_to_quaternion(rotation_mat)
@@ -187,7 +199,7 @@ def example(
         anim.parents,
         chain,
         target_points,
-        3
+        3,
     )
 
     anim.rotations = Quaternions(rotation.numpy())

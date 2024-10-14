@@ -255,7 +255,7 @@ class GAN_model(BaseModel):
                 # fake_pos = self.models[dst].fk.forward_from_raw(
                 #     fake_res_denorm, self.dataset.offsets[dst][rnd_idx]
                 # )
-                for step in range(100):
+                for step in range(1):
                     optimizer.zero_grad()
                     fake_res = self.models[dst].auto_encoder.dec(
                         temp_latent, dst_offsets_repr
@@ -285,7 +285,7 @@ class GAN_model(BaseModel):
                             tr[..., :, :] = torch.tensor([1, 0, 0, 0]).to(tr.device)
                             tr = tr.unsqueeze(-2)
                             rotation = torch.cat((tr, rotation), dim=-2)
-                            # ee_name_monkey = ['LeftToeBase', 'RightToeBase', 'Head', 'LeftHand', 'RightHand']
+                            ee_name_monkey = ['LeftToeBase', 'RightToeBase', 'Head', 'LeftHand', 'RightHand']
 
                             offset = (self.dataset.offsets[dst][rnd_idx]).unsqueeze(-3)
                             tmp = [
@@ -306,12 +306,17 @@ class GAN_model(BaseModel):
                                     self.models[dst].fk.topology,
                                     chain,
                                     clean_tensor(
-                                        self.res_pos[src][
-                                            :, :, self.dataset.ee_ids[src][3], :
-                                        ]
+                                        fake_pos[:, :, self.dataset.ee_ids[dst][3], :]
                                         - position
                                     ),  # Target position
+                                    # clean_tensor(
+                                    #     self.res_pos[src][
+                                    #         :, :, self.dataset.ee_ids[src][3], :
+                                    #     ]
+                                    #     - position
+                                    # ),  # Target position
                                     i,
+                                    is_log=True,
                                 )  # (1,108,28,4) => (1,28,4,108)
                                 result = result[..., 1:, :]
                                 result = result.reshape(
